@@ -10,14 +10,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 UTILS_PATH = ROOT / "src" / "voxcpm" / "model" / "utils.py"
 
-transformers_stub = types.ModuleType("transformers")
-transformers_stub.PreTrainedTokenizer = object
-sys.modules.setdefault("transformers", transformers_stub)
-
-spec = importlib.util.spec_from_file_location("voxcpm.model.utils", UTILS_PATH)
-utils = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(utils)
+# Keep the lightweight import stub local: datasets inspects the real tokenizer
+# base class when other test modules prepare training manifests.
+with pytest.MonkeyPatch.context() as import_patch:
+    if "transformers" not in sys.modules:
+        transformers_stub = types.ModuleType("transformers")
+        transformers_stub.PreTrainedTokenizer = object
+        import_patch.setitem(sys.modules, "transformers", transformers_stub)
+    spec = importlib.util.spec_from_file_location("voxcpm.model.utils", UTILS_PATH)
+    utils = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(utils)
 
 
 def test_resolve_runtime_device_auto_falls_back_to_cpu(monkeypatch):

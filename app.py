@@ -213,25 +213,77 @@ _CUSTOM_CSS = """
 }
 """
 
-_APP_THEME = gr.themes.Soft(
-    primary_hue="blue",
-    secondary_hue="gray",
-    neutral_hue="slate",
-    font=[gr.themes.GoogleFont("Inter"), "Arial", "sans-serif"],
-)
+
+def create_app_theme(local_files_only: bool = False):
+    fonts = (
+        {"font": ["Arial", "sans-serif"], "font_mono": ["Consolas", "monospace"]}
+        if local_files_only
+        else {"font": [gr.themes.GoogleFont("Inter"), "Arial", "sans-serif"]}
+    )
+    return gr.themes.Soft(primary_hue="blue", secondary_hue="gray", neutral_hue="slate", **fonts)
+
+
+def validate_local_models(model_id: str, asr_model_id: str, zipenhancer_model_id: str) -> None:
+    """Reject missing offline assets before any model loader can attempt a download."""
+    required_files = (
+        (
+            model_id,
+            "VoxCPM",
+            (
+                ("config.json",),
+                ("tokenizer_config.json",),
+                ("tokenizer.json", "tokenizer.model"),
+                ("model.safetensors", "pytorch_model.bin"),
+                ("audiovae.safetensors", "audiovae.pth"),
+            ),
+        ),
+        (
+            asr_model_id,
+            "SenseVoice",
+            (
+                ("configuration.json",),
+                ("config.yaml",),
+                ("model.pt",),
+                ("am.mvn",),
+                ("chn_jpn_yue_eng_ko_spectok.bpe.model",),
+            ),
+        ),
+        (zipenhancer_model_id, "ZipEnhancer", (("configuration.json",), ("pytorch_model.bin",))),
+    )
+    for location, name, groups in required_files:
+        directory = Path(location)
+        if not directory.is_dir():
+            raise ValueError(f"{name}: --local-files-only requires an existing local model directory: {location}")
+        for alternatives in groups:
+            if not any(
+                (directory / filename).is_file() and (directory / filename).stat().st_size for filename in alternatives
+            ):
+                raise ValueError(f"{name}: missing local model file ({' or '.join(alternatives)}) in {location}")
 
 
 # ---------- Model ----------
 
 
 class VoxCPMDemo:
-    def __init__(self, model_id: str = "openbmb/VoxCPM2", device: str = "auto") -> None:
+    def __init__(
+        self,
+        model_id: str = "openbmb/VoxCPM2",
+        device: str = "auto",
+        asr_model_id: str = "iic/SenseVoiceSmall",
+        zipenhancer_model_id: str = "iic/speech_zipenhancer_ans_multiloss_16k_base",
+        local_files_only: bool = False,
+        optimize: bool = True,
+    ) -> None:
+        if local_files_only:
+            validate_local_models(model_id, asr_model_id, zipenhancer_model_id)
+        self.local_files_only = local_files_only
+        self.zipenhancer_model_id = zipenhancer_model_id
         self.device = resolve_runtime_device(device, "cuda")
         logger.info(f"Running VoxCPM on device: {self.device}")
-        self.optimize = self.device.startswith("cuda")
+        self.optimize = optimize and self.device.startswith("cuda")
 
-        self.asr_model_id = "iic/SenseVoiceSmall"
-        self.asr_device = "cuda:0" if self.device.startswith("cuda") else "cpu"
+        self.asr_model_id = asr_model_id
+        self.asr_device = self.device if self.device.startswith("cuda") else "cpu"
         self.asr_model: Optional[AutoModel] = None
 
         self.voxcpm_model: Optional[voxcpm.VoxCPM] = None
@@ -243,6 +295,8 @@ class VoxCPMDemo:
         logger.info(f"Loading model: {self._model_id}")
         self.voxcpm_model = voxcpm.VoxCPM.from_pretrained(
             self._model_id,
+            zipenhancer_model_id=self.zipenhancer_model_id,
+            local_files_only=self.local_files_only,
             optimize=self.optimize,
             device=self.device,
         )
@@ -256,6 +310,7 @@ class VoxCPMDemo:
         self.asr_model = AutoModel(
             model=self.asr_model_id,
             disable_update=True,
+            check_latest=False,
             log_level="DEBUG",
             device=self.asr_device,
         )
@@ -420,7 +475,7 @@ def create_demo_interface(demo: VoxCPMDemo):
             logger.warning(f"ASR recognition failed: {e}")
             return gr.update(value="")
 
-    with gr.Blocks() as interface:
+    with gr.Blocks(analytics_enabled=False if demo.local_files_only else None) as interface:
         gr.HTML(
             '<div class="logo-container">'
             '<img src="/gradio_api/file=assets/voxcpm_logo.png" alt="VoxCPM Logo">'
@@ -519,6 +574,8 @@ def create_demo_interface(demo: VoxCPMDemo):
             fn=_run_asr_if_needed,
             inputs=[show_prompt_text, reference_wav],
             outputs=[prompt_text],
+            concurrency_id="voxcpm_gpu",
+            concurrency_limit=1,
         )
 
         random_seed.change(
@@ -549,6 +606,8 @@ def create_demo_interface(demo: VoxCPMDemo):
             outputs=[audio_output, seed_value],
             show_progress=True,
             api_name="generate",
+            concurrency_id="voxcpm_gpu",
+            concurrency_limit=1,
         )
 
     return interface
@@ -560,16 +619,28 @@ def run_demo(
     show_error: bool = True,
     model_id: str = "openbmb/VoxCPM2",
     device: str = "auto",
+    asr_model_id: str = "iic/SenseVoiceSmall",
+    zipenhancer_model_id: str = "iic/speech_zipenhancer_ans_multiloss_16k_base",
+    local_files_only: bool = False,
+    optimize: bool = True,
 ):
-    demo = VoxCPMDemo(model_id=model_id, device=device)
+    demo = VoxCPMDemo(
+        model_id=model_id,
+        device=device,
+        asr_model_id=asr_model_id,
+        zipenhancer_model_id=zipenhancer_model_id,
+        local_files_only=local_files_only,
+        optimize=optimize,
+    )
     interface = create_demo_interface(demo)
     interface.queue(max_size=10, default_concurrency_limit=1).launch(
         server_name=server_name,
         server_port=server_port,
         show_error=show_error,
         i18n=I18N,
-        theme=_APP_THEME,
+        theme=create_app_theme(local_files_only),
         css=_CUSTOM_CSS,
+        share=False if local_files_only else None,
     )
 
 
@@ -585,11 +656,25 @@ if __name__ == "__main__":
     )
     parser.add_argument("--port", type=int, default=8808, help="Server port")
     parser.add_argument(
+        "--no-optimize", action="store_true", help="Disable torch.compile while retaining the chosen device"
+    )
+    parser.add_argument("--asr-model-id", default="iic/SenseVoiceSmall", help="Local path or ModelScope ASR repo ID")
+    parser.add_argument(
+        "--zipenhancer-model-id",
+        default="iic/speech_zipenhancer_ans_multiloss_16k_base",
+        help="Local path or ModelScope denoiser repo ID",
+    )
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Require all three models locally and disable external UI services",
+    )
+    parser.add_argument(
         "--host",
         type=str,
         default="0.0.0.0",
         help="Bind address. Use 127.0.0.1 to restrict access to the local machine; "
-             "the default 0.0.0.0 exposes the unauthenticated UI/API to the network (default: 0.0.0.0)",
+        "the default 0.0.0.0 exposes the unauthenticated UI/API to the network (default: 0.0.0.0)",
     )
     parser.add_argument(
         "--device",
@@ -603,4 +688,8 @@ if __name__ == "__main__":
         server_name=args.host,
         server_port=args.port,
         device=args.device,
+        asr_model_id=args.asr_model_id,
+        zipenhancer_model_id=args.zipenhancer_model_id,
+        local_files_only=args.local_files_only,
+        optimize=not args.no_optimize,
     )
